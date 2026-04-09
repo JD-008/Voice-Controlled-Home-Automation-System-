@@ -1,0 +1,1 @@
+a voice-controlled smart home system using 8051 (Assembly via Keil) and ESP8266 (Arduino IDE), integrating Google Assistant via IFTTT and Adafruit IO (MQTT) for real-time appliance control with LCD feedback, combining cloud-based automation and manual dashboard control in a scalable, cost-effective IoT solution
