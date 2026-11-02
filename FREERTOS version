@@ -1,0 +1,180 @@
+/*
+  Voice-Controlled Home Automation — ESP32 + FreeRTOS (single-chip redesign)
+  ---------------------------------------------------------------------------
+  Replaces the old ESP8266 + 8051 pair with one ESP32 running FreeRTOS tasks.
+
+  Pipeline (unchanged from the original report):
+    Google Assistant -> IFTTT -> Adafruit IO feed ("bulb-control")
+    -> ESP32 (MQTT subscriber) -> Relay -> Bulb, LCD shows status
+
+  FreeRTOS tasks:
+    1. vWifiMqttTask   - WiFi + MQTT (Adafruit IO), pushes commands to a queue
+    2. vApplianceTask  - Owns relay + LCD, consumes the queue, publishes state back
+
+  Libraries needed (Arduino Library Manager):
+    - PubSubClient   by Nick O'Leary
+    - Adafruit GFX Library
+    - Adafruit SSD1306
+    - Wire            (built-in)
+
+  Display: 0.96" SSD1306 OLED, 128x64, I2C (SDA=GPIO21, SCL=GPIO22)
+  Board: ESP32 Dev Module (Arduino-ESP32 core already bundles FreeRTOS)
+*/
+
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ---------------- User configuration ----------------
+const char* WIFI_SSID     = "        ";
+const char* WIFI_PASSWORD = "         ";
+
+// Adafruit IO (or any MQTT broker that IFTTT can write to)
+const char* MQTT_SERVER   = "io.adafruit.com";
+const int   MQTT_PORT     = 1883;
+const char* MQTT_USER     = "JDR08";
+const char* MQTT_KEY      = "            ";          // used as MQTT password
+const char* MQTT_CLIENTID = "esp32-home-automation";
+
+const char* FEED_CONTROL  = "https://io.adafruit.com/api/v2/JDR08/feeds/light-control"; // subscribe
+const char* FEED_STATE    = "https://io.adafruit.com/api/v2/JDR08/feeds/light-control/ON";   // publish back
+
+// ---------------- Pin map ----------------
+#define RELAY_PIN   26
+
+// SSD1306 OLED (0.96", 128x64) over I2C
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1     // no reset pin (set to -1)
+#define OLED_I2C_ADDR 0x3C   // typical I2C address for 128x64 SSD1306
+// SDA -> GPIO21, SCL -> GPIO22 (default ESP32 I2C pins, wired directly)
+
+// ---------------- RTOS primitives ----------------
+enum Command : uint8_t { CMD_ON, CMD_OFF };
+
+QueueHandle_t  commandQueue;   // holds Command values
+SemaphoreHandle_t stateMutex;  // protects bulbState
+
+WiFiClient   wifiClient;
+PubSubClient mqttClient(wifiClient);
+
+// I2C constructor: uses default Wire (SDA=21, SCL=22)
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+volatile bool bulbState = false; // true = ON
+
+// ---------------- MQTT callback ----------------
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+  msg.trim();
+  msg.toUpperCase();
+
+  Command cmd;
+  if (msg == "ON")  cmd = CMD_ON;
+  else if (msg == "OFF") cmd = CMD_OFF;
+  else return; // ignore unrecognized payloads
+
+  // Send to the appliance task; don't block the MQTT callback
+  xQueueSend(commandQueue, &cmd, 0);
+}
+
+// ---------------- Task 1: WiFi + MQTT ----------------
+void vWifiMqttTask(void *pvParameters) {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+  mqttClient.setCallback(mqttCallback);
+
+  for (;;) {
+    if (WiFi.status() != WL_CONNECTED) {
+      WiFi.reconnect();
+      vTaskDelay(pdMS_TO_TICKS(2000));
+      continue;
+    }
+
+    if (!mqttClient.connected()) {
+      if (mqttClient.connect(MQTT_CLIENTID, MQTT_USER, MQTT_KEY)) {
+        mqttClient.subscribe(FEED_CONTROL);
+      } else {
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        continue;
+      }
+    }
+
+    mqttClient.loop();          // process incoming MQTT messages
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+
+// ---------------- Task 2: Relay + LCD (single owner) ----------------
+void applyState(bool on) {
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  bulbState = on;
+  xSemaphoreGive(stateMutex);
+
+  digitalWrite(RELAY_PIN, on ? HIGH : LOW);
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Smart Home");
+  display.drawLine(0, 10, SCREEN_WIDTH - 1, 10, SSD1306_WHITE);
+
+  display.setTextSize(2);
+  display.setCursor(0, 24);
+  display.println(on ? "LIGHTS: ON" : "LIGHTS : OFF");
+  display.display();
+
+  if (mqttClient.connected()) {
+    mqttClient.publish(FEED_STATE, on ? "ON" : "OFF");
+  }
+}
+
+void vApplianceTask(void *pvParameters) {
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDR)) {
+    Serial.println("SSD1306 allocation failed");
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Smart Home");
+  display.setCursor(0, 20);
+  display.println("Booting...");
+  display.display();
+
+  Command cmd;
+  for (;;) {
+    if (xQueueReceive(commandQueue, &cmd, portMAX_DELAY) == pdTRUE) {
+      switch (cmd) {
+        case CMD_ON:  applyState(true);  break;
+        case CMD_OFF: applyState(false); break;
+      }
+    }
+  }
+}
+
+// ---------------- setup / loop ----------------
+void setup() {
+  Serial.begin(115200);
+
+  commandQueue = xQueueCreate(10, sizeof(Command));
+  stateMutex   = xSemaphoreCreateMutex();
+
+  xTaskCreatePinnedToCore(vWifiMqttTask,  "WifiMqtt",  4096, NULL, 2, NULL, 0);
+  xTaskCreatePinnedToCore(vApplianceTask, "Appliance", 3072, NULL, 2, NULL, 1);
+}
+
+void loop() {
+  // Intentionally empty — everything runs in FreeRTOS tasks.
+  vTaskDelay(pdMS_TO_TICKS(1000));
+}
